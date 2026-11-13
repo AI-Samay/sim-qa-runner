@@ -16,7 +16,7 @@
 #   6. If upload=true: uploads with `xcrun altool --upload-app` using the ASC API key secret.
 #   7. Uploads the IPA and logs as a short-lived artifact.
 #
-# Secrets: EXPO_TOKEN, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (only for upload),
+# Secrets: EXPO_TOKEN (krosz), EXPO_TOKEN_KROSZS_TEAM (kroszs-team, e.g. ClearScan), ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (only for upload),
 #          CHECKOUT_TOKEN (optional, only for private target repos).
 name: iOS Local Build (free, eas --local)
 
@@ -56,6 +56,14 @@ on:
         description: Node.js version
         required: false
         default: '22'
+      expo_account:
+        description: Expo account that owns the project (selects the token secret)
+        required: false
+        type: choice
+        default: krosz
+        options:
+          - krosz
+          - kroszs-team
 
 concurrency:
   group: local-ios-build-${{ inputs.repo }}
@@ -79,7 +87,7 @@ jobs:
       - name: Check target and secrets
         env:
           TARGET: ${{ inputs.repo }}
-          HAS_EXPO: ${{ secrets.EXPO_TOKEN != '' }}
+          HAS_EXPO: ${{ (inputs.expo_account == 'kroszs-team' && secrets.EXPO_TOKEN_KROSZS_TEAM || secrets.EXPO_TOKEN) != '' }}
           HAS_ASC: ${{ secrets.ASC_KEY_ID != '' && secrets.ASC_ISSUER_ID != '' && secrets.ASC_KEY_P8 != '' }}
           UPLOAD: ${{ inputs.upload }}
           BN: ${{ inputs.build_number }}
@@ -87,7 +95,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$OUT"
           case "$TARGET" in samayhuf-star/*|AI-Samay/*) ;; *) echo "Refusing: $TARGET is not owned by samayhuf-star or AI-Samay"; exit 1;; esac
-          [ "$HAS_EXPO" = "true" ] || { echo "Missing secret EXPO_TOKEN"; exit 1; }
+          [ "$HAS_EXPO" = "true" ] || { echo "Missing Expo token secret (EXPO_TOKEN for krosz, EXPO_TOKEN_KROSZS_TEAM for kroszs-team)"; exit 1; }
           if [ "$UPLOAD" = "true" ] && [ "$HAS_ASC" != "true" ]; then echo "upload=true needs ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8"; exit 1; fi
           if [ -n "$BN" ]; then echo "$BN" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$' || { echo "build_number must be like 7 or 1.0.7"; exit 1; }; fi
           echo "target: $TARGET"
@@ -148,7 +156,7 @@ jobs:
       - name: eas build --local (iOS)
         working-directory: ${{ env.APP_DIR }}
         env:
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_TOKEN: ${{ inputs.expo_account == 'kroszs-team' && secrets.EXPO_TOKEN_KROSZS_TEAM || secrets.EXPO_TOKEN }}
           PROFILE: ${{ inputs.profile }}
         run: |
           set -euo pipefail
