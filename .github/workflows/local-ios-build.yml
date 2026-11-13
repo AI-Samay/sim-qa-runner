@@ -14,7 +14,7 @@
 #   4. npx eas-cli build --local --platform ios --profile <profile> --output build.ipa
 #   5. Verifies the IPA signature (team, App Store profile).
 #   6. If upload=true: uploads with `xcrun altool --upload-app` using the ASC API key secret.
-#   7. Uploads the IPA and logs as a short-lived artifact.
+#   7. Uploads only logs and the signature-check summary as a short-lived artifact (secrets scrubbed). The IPA is never an artifact; it stays on the runner and is sent to ASC with altool only when upload=true.
 #
 # Secrets: EXPO_TOKEN (krosz), EXPO_TOKEN_KROSZS_TEAM (kroszs-team, e.g. ClearScan), ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (only for upload),
 #          CHECKOUT_TOKEN (optional, only for private target repos).
@@ -209,20 +209,141 @@ jobs:
         if: always()
         run: rm -rf ~/.appstoreconnect/private_keys
 
-      - name: Collect logs
-        if: always()
+      - name: Record IPA metadata
+        if: ${{ always() && inputs.upload == false }}
         run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          IPA="$GITHUB_WORKSPACE/build.ipa"
+          if [ ! -f "$IPA" ]; then
+            echo "No IPA on the runner; skip metadata."
+            exit 0
+          fi
+          SIZE_BYTES=$(stat -f%z "$IPA")
+          SHA256=$(shasum -a 256 "$IPA" | awk '{print $1}')
+          SIG="$OUT/signing.txt"
+          if [ ! -f "$SIG" ]; then
+            echo "signing.txt missing; extracting identity fields from the IPA."
+            T=$(mktemp -d)
+            unzip -q "$IPA" -d "$T"
+            APP=$(ls -d "$T"/Payload/*.app | head -n1)
+            {
+              /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | sed 's/^/bundle id: /'
+              /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | sed 's/^/version: /'
+              /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" | sed 's/^/build: /'
+              codesign -dvv "$APP" 2>&1 | grep -E '^(Authority|TeamIdentifier|Identifier)=' || true
+            } > "$SIG"
+          fi
+          BUNDLE=$(awk -F': ' '/^bundle id: /{print $2; exit}' "$SIG" || true)
+          VERSION=$(awk -F': ' '/^version: /{print $2; exit}' "$SIG" || true)
+          BUILD=$(awk -F': ' '/^build: /{print $2; exit}' "$SIG" || true)
+          IDENTITY=$(awk -F= '/^Authority=/{print $2; exit}' "$SIG" || true)
+          {
+            echo "sha256: $SHA256"
+            echo "size_bytes: $SIZE_BYTES"
+            echo "bundle id: ${BUNDLE:-unknown}"
+            echo "version: ${VERSION:-unknown}"
+            echo "build: ${BUILD:-unknown}"
+            echo "signing identity: ${IDENTITY:-unknown}"
+          } | tee "$OUT/ipa-meta.txt"
+          {
+            echo "### IPA metadata (not uploaded; IPA stays on the runner)"
+            echo "- SHA-256: \`$SHA256\`"
+            echo "- Size: $SIZE_BYTES bytes"
+            echo "- Bundle id: ${BUNDLE:-unknown}"
+            echo "- Version: ${VERSION:-unknown}"
+            echo "- Signing identity: ${IDENTITY:-unknown}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect and scrub logs
+        if: always()
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_TOKEN_KROSZS_TEAM: ${{ secrets.EXPO_TOKEN_KROSZS_TEAM }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          CHECKOUT_TOKEN: ${{ secrets.CHECKOUT_TOKEN }}
+        run: |
+          set -euo pipefail
           mkdir -p "$OUT/xcode-logs"
           cp -R "$EAS_LOCAL_BUILD_WORKINGDIR"/logs/. "$OUT/xcode-logs/" 2>/dev/null || true
           find "$EAS_LOCAL_BUILD_WORKINGDIR" -maxdepth 6 -name '*.log' -path '*logs*' -exec cp {} "$OUT/xcode-logs/" \; 2>/dev/null || true
-          [ -f "$GITHUB_WORKSPACE/build.ipa" ] && cp "$GITHUB_WORKSPACE/build.ipa" "$OUT/" || true
+          # Never copy the IPA into the logs folder; it must not become a public artifact.
+          find "$OUT" -type f \( -iname '*.ipa' -o -iname '*.p8' -o -iname '*.p12' -o -iname '*.mobileprovision' -o -iname '*.cer' -o -iname '*.cert' -o -iname '*.key' -o -iname '*.pem' \) -delete 2>/dev/null || true
+          python3 <<'PY'
+          import os, pathlib, re
+
+          def collect_secrets():
+              keys = (
+                  "EXPO_TOKEN",
+                  "EXPO_TOKEN_KROSZS_TEAM",
+                  "ASC_KEY_ID",
+                  "ASC_ISSUER_ID",
+                  "ASC_KEY_P8",
+                  "CHECKOUT_TOKEN",
+              )
+              values = []
+              for key in keys:
+                  raw = (os.environ.get(key) or "").strip()
+                  if len(raw) >= 8:
+                      values.append(raw)
+                  for line in raw.splitlines():
+                      line = line.strip()
+                      if len(line) >= 16 and "BEGIN " not in line and "END " not in line:
+                          values.append(line)
+              return sorted(set(values), key=len, reverse=True)
+
+          secrets = collect_secrets()
+          privkey = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)
+          jwt = re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+          bearer = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-+=/]+")
+          banned = {".ipa", ".p8", ".p12", ".mobileprovision", ".cer", ".cert", ".key", ".pem"}
+          root = pathlib.Path(os.environ["OUT"])
+          removed = 0
+          scrubbed = 0
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              if path.suffix.lower() in banned or path.name.lower().endswith(".ipa"):
+                  path.unlink()
+                  removed += 1
+                  continue
+              try:
+                  raw = path.read_bytes()
+              except OSError:
+                  continue
+              if b"\0" in raw[:4096]:
+                  continue
+              text = raw.decode("utf-8", errors="replace")
+              new = text
+              for secret in secrets:
+                  new = new.replace(secret, "[REDACTED]")
+              new = privkey.sub("[REDACTED PRIVATE KEY]", new)
+              new = jwt.sub("[REDACTED JWT]", new)
+              new = bearer.sub(r"\1[REDACTED]", new)
+              if new != text:
+                  path.write_text(new)
+                  scrubbed += 1
+          print(f"log collect: removed {removed} credential/ipa file(s), scrubbed {scrubbed} file(s)")
+          PY
+          unset EXPO_TOKEN EXPO_TOKEN_KROSZS_TEAM ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 CHECKOUT_TOKEN || true
           tail -n 40 "$OUT/eas-build.log" 2>/dev/null || true
 
-      - name: Upload IPA and logs
+      - name: Upload logs and signing summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ios-build-${{ github.run_id }}
+          name: ios-build-logs-${{ github.run_id }}
           retention-days: 3
           if-no-files-found: warn
-          path: _out/**
+          path: |
+            _out/**
+            !_out/**/*.ipa
+            !_out/**/*.p8
+            !_out/**/*.p12
+            !_out/**/*.mobileprovision
+            !_out/**/*.cer
+            !_out/**/*.cert
+            !_out/**/*.key
+            !_out/**/*.pem
