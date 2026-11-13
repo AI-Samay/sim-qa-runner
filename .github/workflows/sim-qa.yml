@@ -60,10 +60,12 @@ jobs:
       - name: Target must be a public repo
         env:
           TARGET: ${{ inputs.repo }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          mkdir -p "$OUT"
           case "$TARGET" in */*) ;; *) echo "repo must be owner/name"; exit 1;; esac
-          PRIV=$(curl -fsSL "https://api.github.com/repos/$TARGET" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("private", True))')
+          PRIV=$(curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$TARGET" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("private", True))')
           [ "$PRIV" = "False" ] || { echo "Refusing: $TARGET is not a public repo"; exit 1; }
           echo "target: $TARGET (public)"
 
