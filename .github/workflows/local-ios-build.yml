@@ -87,7 +87,7 @@ jobs:
       - name: Check target and secrets
         env:
           TARGET: ${{ inputs.repo }}
-          HAS_EXPO: ${{ (inputs.expo_account == 'kroszs-team' && secrets.EXPO_TOKEN_KROSZS_TEAM || secrets.EXPO_TOKEN) != '' }}
+          HAS_EXPO: ${{ (inputs.expo_account == 'kroszs-team' && secrets.EXPO_TOKEN_KROSZS_TEAM != '') || (inputs.expo_account != 'kroszs-team' && secrets.EXPO_TOKEN != '') }}
           HAS_ASC: ${{ secrets.ASC_KEY_ID != '' && secrets.ASC_ISSUER_ID != '' && secrets.ASC_KEY_P8 != '' }}
           UPLOAD: ${{ inputs.upload }}
           BN: ${{ inputs.build_number }}
