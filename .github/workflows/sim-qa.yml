@@ -41,6 +41,11 @@ on:
         options:
           - macos-latest
           - macos-15
+      save_app:
+        description: Also save the Release iphonesimulator .app as a zipped artifact (unsigned simulator build, not an IPA)
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: sim-qa-${{ inputs.repo }}-${{ inputs.ref }}
@@ -149,6 +154,24 @@ jobs:
             CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= \
             > "$OUT/xcodebuild.log" 2>&1 || { tail -n 120 "$OUT/xcodebuild.log"; exit 1; }
           tail -n 20 "$OUT/xcodebuild.log"
+
+      - name: Zip simulator app
+        if: ${{ inputs.save_app }}
+        run: |
+          set -euo pipefail
+          APP=$(ls -d "$DERIVED_DATA"/Build/Products/Release-iphonesimulator/*.app | head -n 1)
+          echo "Saving $APP"
+          mkdir -p /tmp/sim-app
+          (cd "$(dirname "$APP")" && ditto -c -k --sequesterRsrc --keepParent "$(basename "$APP")" /tmp/sim-app/$(basename "$APP" .app)-iphonesimulator-Release.zip)
+          ls -la /tmp/sim-app
+
+      - name: Upload simulator app
+        if: ${{ inputs.save_app }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-app-${{ github.run_id }}
+          path: /tmp/sim-app/*.zip
+          retention-days: 7
 
       - name: Run flow
         run: |
