@@ -1,0 +1,220 @@
+# Free iOS App Store build for Samay Vashsht's Expo app repos, run from this repo.
+# Manual trigger only (workflow_dispatch). Runs on GitHub's free hosted macOS runners.
+#
+# Uses `eas build --local`: the build runs on this runner, NOT on Expo's build servers,
+# so it uses no Expo Build credits. EAS is only contacted to check the project exists,
+# to read/increment the remote build number (appVersionSource: remote) and to download
+# the managed signing credentials (dist cert + App Store provisioning profile).
+# A cloud `eas build` (without --local) and `eas submit` are never run here.
+#
+# Steps:
+#   1. Allow-listed owner check, checkout `repo` at `ref`, pick Xcode, set up Node.
+#   2. npm ci (in `app_dir` if set).
+#   3. Optional build_number override (switches that runner copy to local versioning).
+#   4. npx eas-cli build --local --platform ios --profile <profile> --output build.ipa
+#   5. Verifies the IPA signature (team, App Store profile).
+#   6. If upload=true: uploads with `xcrun altool --upload-app` using the ASC API key secret.
+#   7. Uploads the IPA and logs as a short-lived artifact.
+#
+# Secrets: EXPO_TOKEN, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (only for upload),
+#          CHECKOUT_TOKEN (optional, only for private target repos).
+name: iOS Local Build (free, eas --local)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Target app repo (owner/name), owner samayhuf-star or AI-Samay
+        required: true
+        default: samayhuf-star/klenzer
+      ref:
+        description: Branch, tag or commit to build
+        required: true
+        default: main
+      profile:
+        description: eas.json build profile
+        required: true
+        default: production
+      app_dir:
+        description: App folder inside the repo (blank = repo root; Playsz uses "app")
+        required: false
+        default: ''
+      build_number:
+        description: Optional CFBundleVersion override (blank = eas.json versioning, e.g. remote autoIncrement)
+        required: false
+        default: ''
+      upload:
+        description: Upload the IPA to App Store Connect (TestFlight processing) with the ASC API key
+        required: true
+        type: boolean
+        default: false
+      xcode_version:
+        description: Xcode version for setup-xcode (e.g. latest-stable, 26.1, 16.4)
+        required: false
+        default: latest-stable
+      node_version:
+        description: Node.js version
+        required: false
+        default: '22'
+
+concurrency:
+  group: local-ios-build-${{ inputs.repo }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: iOS build (${{ inputs.repo }}@${{ inputs.ref }}, ${{ inputs.profile }}, upload=${{ inputs.upload }})
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      OUT: ${{ github.workspace }}/_out
+      APP_DIR: ${{ github.workspace }}/app-src/${{ inputs.app_dir }}
+      EAS_LOCAL_BUILD_WORKINGDIR: /tmp/eas-build
+      EAS_LOCAL_BUILD_SKIP_CLEANUP: '1'
+      EXPO_NO_TELEMETRY: '1'
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - name: Check target and secrets
+        env:
+          TARGET: ${{ inputs.repo }}
+          HAS_EXPO: ${{ secrets.EXPO_TOKEN != '' }}
+          HAS_ASC: ${{ secrets.ASC_KEY_ID != '' && secrets.ASC_ISSUER_ID != '' && secrets.ASC_KEY_P8 != '' }}
+          UPLOAD: ${{ inputs.upload }}
+          BN: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          case "$TARGET" in samayhuf-star/*|AI-Samay/*) ;; *) echo "Refusing: $TARGET is not owned by samayhuf-star or AI-Samay"; exit 1;; esac
+          [ "$HAS_EXPO" = "true" ] || { echo "Missing secret EXPO_TOKEN"; exit 1; }
+          if [ "$UPLOAD" = "true" ] && [ "$HAS_ASC" != "true" ]; then echo "upload=true needs ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8"; exit 1; fi
+          if [ -n "$BN" ]; then echo "$BN" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$' || { echo "build_number must be like 7 or 1.0.7"; exit 1; }; fi
+          echo "target: $TARGET"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          path: app-src
+          token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+          persist-credentials: false
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ inputs.xcode_version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          { xcodebuild -version; node -v; npm -v; pod --version || true; fastlane --version 2>/dev/null | tail -n1 || true; } | tee "$OUT/tools.txt"
+          command -v fastlane >/dev/null || brew install fastlane
+          command -v pod >/dev/null || sudo gem install cocoapods
+          cd "$GITHUB_WORKSPACE/app-src" && git rev-parse HEAD | tee "$OUT/commit.txt"
+
+      - name: Install deps
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then npm ci; elif [ -f yarn.lock ]; then npx --yes yarn install --frozen-lockfile; else npm install; fi
+
+      - name: Build number override
+        if: inputs.build_number != ''
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          BN: ${{ inputs.build_number }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          [ -f app.json ] || { echo "build_number override needs app.json in $APP_DIR"; exit 1; }
+          node -e '
+            const fs=require("fs"); const bn=process.env.BN, p=process.env.PROFILE;
+            const eas=JSON.parse(fs.readFileSync("eas.json","utf8"));
+            eas.cli=eas.cli||{}; eas.cli.appVersionSource="local";
+            const prof=(eas.build||{})[p]; if(!prof){console.error("no profile "+p);process.exit(1)}
+            delete prof.autoIncrement; if(prof.ios) delete prof.ios.autoIncrement;
+            fs.writeFileSync("eas.json", JSON.stringify(eas,null,2)+"\n");
+            const app=JSON.parse(fs.readFileSync("app.json","utf8")); const e=app.expo||app;
+            e.ios=e.ios||{}; e.ios.buildNumber=String(bn);
+            fs.writeFileSync("app.json", JSON.stringify(app,null,2)+"\n");
+            console.log("buildNumber="+bn+" (appVersionSource local for this run only, remote counter untouched)");'
+          # eas --local archives the git tree, so commit the override on the runner only (never pushed).
+          git -c user.name=ci -c user.email=ci@localhost commit -q -am "ci: buildNumber $BN (runner only)"
+
+      - name: eas build --local (iOS)
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EAS_LOCAL_BUILD_WORKINGDIR"
+          npx --yes eas-cli@latest whoami
+          # --local keeps the whole build on this runner: no Expo Build credits are used.
+          npx --yes eas-cli@latest build --local --non-interactive --platform ios \
+            --profile "$PROFILE" --output "$GITHUB_WORKSPACE/build.ipa" 2>&1 | tee "$OUT/eas-build.log"
+          ls -la "$GITHUB_WORKSPACE/build.ipa"
+
+      - name: Verify IPA signature
+        run: |
+          set -euo pipefail
+          T=$(mktemp -d); unzip -q "$GITHUB_WORKSPACE/build.ipa" -d "$T"
+          APP=$(ls -d "$T"/Payload/*.app | head -n1)
+          {
+            echo "app: $(basename "$APP")"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | sed 's/^/bundle id: /'
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | sed 's/^/version: /'
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" | sed 's/^/build: /'
+            codesign -dvv "$APP" 2>&1 | grep -E '^(Authority|TeamIdentifier|Identifier)=' || true
+            security cms -D -i "$APP/embedded.mobileprovision" > "$T/prof.plist"
+            echo "profile: $(/usr/libexec/PlistBuddy -c 'Print :Name' "$T/prof.plist")"
+            echo "profile team: $(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$T/prof.plist")"
+            echo "profile expires: $(/usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$T/prof.plist")"
+            echo "get-task-allow: $(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$T/prof.plist")"
+            if /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$T/prof.plist" >/dev/null 2>&1; then echo "profile type: AD HOC / DEVELOPMENT (has device list)"; else echo "profile type: APP STORE (no device list)"; fi
+          } | tee "$OUT/signing.txt"
+          codesign --verify --deep --strict "$APP" && echo "codesign verify: OK" | tee -a "$OUT/signing.txt"
+          { echo "### IPA signing"; echo '```'; cat "$OUT/signing.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          grep -q 'TeamIdentifier=PGLT2QZX88' "$OUT/signing.txt" || echo "::warning::IPA team is not PGLT2QZX88"
+          grep -q 'profile type: APP STORE' "$OUT/signing.txt" || echo "::warning::IPA is not signed with an App Store profile"
+
+      - name: Upload to App Store Connect (altool)
+        if: inputs.upload
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s\n' "$ASC_KEY_P8" > ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          xcrun altool --upload-app -f "$GITHUB_WORKSPACE/build.ipa" -t ios \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --output-format normal 2>&1 | tee "$OUT/altool-upload.log"
+          echo "Uploaded. Build will appear in App Store Connect after processing." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove ASC key
+        if: always()
+        run: rm -rf ~/.appstoreconnect/private_keys
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$OUT/xcode-logs"
+          cp -R "$EAS_LOCAL_BUILD_WORKINGDIR"/logs/. "$OUT/xcode-logs/" 2>/dev/null || true
+          find "$EAS_LOCAL_BUILD_WORKINGDIR" -maxdepth 6 -name '*.log' -path '*logs*' -exec cp {} "$OUT/xcode-logs/" \; 2>/dev/null || true
+          [ -f "$GITHUB_WORKSPACE/build.ipa" ] && cp "$GITHUB_WORKSPACE/build.ipa" "$OUT/" || true
+          tail -n 40 "$OUT/eas-build.log" 2>/dev/null || true
+
+      - name: Upload IPA and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-${{ github.run_id }}
+          retention-days: 3
+          if-no-files-found: warn
+          path: _out/**
